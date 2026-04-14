@@ -363,6 +363,7 @@ class DockerTreeApp(App):
         Binding("h", "collapse_node","Collapse", show=False),
         Binding("u", "prev_tab",    "Prev tab", show=False),
         Binding("i", "next_tab",    "Next tab", show=False),
+        Binding("y", "copy_cell",   "Copy Cell"),
         Binding("a", "toggle_all",  "Toggle All (Dangling)"),
         Binding("f", "filter",      "Filter Branches"),
         Binding("q", "quit",        "Quit"),
@@ -634,6 +635,34 @@ class DockerTreeApp(App):
         self._show_all = not self._show_all
         self.push_screen(LoadingScreen())
         self._fetch_docker_data()
+
+    def action_copy_cell(self) -> None:
+        focused = self.app.focused
+        text_to_copy = ""
+
+        if focused is not None and focused.id == "images-table" and isinstance(focused, DataTable):
+            if focused.cursor_coordinate:
+                try:
+                    cell = focused.get_cell_at(focused.cursor_coordinate)
+                    if hasattr(cell, "plain"):
+                        text_to_copy = cell.plain
+                    else:
+                        text_to_copy = str(cell)
+                except Exception:
+                    pass
+        else:
+            tree = self.query_one("#layer-tree", Tree)
+            if tree.cursor_node and getattr(tree.cursor_node, "data", None) is not None:
+                layer_node = self._node_map.get(tree.cursor_node.data)
+                if layer_node:
+                    text_to_copy = layer_node.command
+
+        if text_to_copy:
+            try:
+                self.app.copy_to_clipboard(text_to_copy)
+                self.notify(f"Copied: {text_to_copy[:40]}", title="Clipboard")
+            except Exception as e:
+                self.notify(f"Failed to copy: {e}", severity="error")
 
 
 # ---------------------------------------------------------------------------
