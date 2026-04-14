@@ -13,6 +13,7 @@ import subprocess
 import pyperclip
 import shlex
 import os
+import tempfile
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional, Callable
@@ -35,17 +36,11 @@ def normalize_command(command: str) -> str:
         res = p.sub(repl, res)
     return res
 
-SUBS_FILE = Path(__file__).parent / "user_substitutions.txt"
+CONFIG_DIR = Path.home() / ".config" / "docker_image_tree" / "substitutions"
+DEFAULT_SUBS_TEXT = '# Define custom regex replacements here.\n# Format: "<regex>" "<replacement>"\n# Example:\n# "^#(nop).*$" "<NOP>"\n\n'
 
-def load_user_substitutions(filepath: Path) -> tuple[list[tuple[re.Pattern, str]], bool]:
-    if not filepath.exists():
-        filepath.parent.mkdir(parents=True, exist_ok=True)
-        filepath.write_text('# Define custom regex replacements here.\n# Format: "<regex>" "<replacement>"\n# Example:\n# "^#(nop).*$" "<NOP>"\n\n')
-        return [], False
-    
-    with filepath.open('r') as f:
-        lines = f.readlines()
-        
+def parse_user_substitutions(raw_text: str) -> tuple[str, list[tuple[re.Pattern, str]], bool]:
+    lines = raw_text.splitlines(keepends=True)
     patterns = []
     invalid = False
     new_lines = []
@@ -57,7 +52,7 @@ def load_user_substitutions(filepath: Path) -> tuple[list[tuple[re.Pattern, str]
             continue
             
         try:
-            tokens = shlex.split(line)
+            tokens = shlex.split(stripped)
             if len(tokens) != 2:
                 raise ValueError("Line must contain exactly two quoted strings.")
             pat = re.compile(tokens[0])
@@ -67,21 +62,19 @@ def load_user_substitutions(filepath: Path) -> tuple[list[tuple[re.Pattern, str]
         except Exception as e:
             invalid = True
             new_lines.append(f"# INVALID ({e}): {line.lstrip()}")
-    
-    if invalid:
-        with filepath.open('w') as f:
-            f.writelines(new_lines)
             
-    return patterns, invalid
+    return "".join(new_lines), patterns, invalid
 
 from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.screen import ModalScreen
+from textual.command import Provider, Hit, DiscoveryHit
 from textual.widgets import (
     Footer,
     Header,
     Input,
+    OptionList,
     Label,
     LoadingIndicator,
     Static,
@@ -322,6 +315,64 @@ class LoadingScreen(ModalScreen):
         except Exception:
             pass  # screen not yet fully mounted – ignore
 
+# ---------------------------------------------------------------------------
+# Command Palette & Config Modals
+# ---------------------------------------------------------------------------
+
+class SubstitutionsCommandProvider(Provider):
+    async def discover(self):
+        yield DiscoveryHit("Save Substitutions Config", lambda app=self.screen.app: app.action_save_subs(), help="Save current substitutions to disk")
+        yield DiscoveryHit("Load Substitutions Config", lambda app=self.screen.app: app.action_load_subs(), help="Load saved substitutions from disk")
+
+    async def search(self, query: str):
+        matcher = self.matcher(query)
+        match1 = matcher.match("Save Substitutions Config")
+        if match1 > 0:
+            yield Hit(match1, matcher.highlight("Save Substitutions Config"), lambda app=self.screen.app: app.action_save_subs(), help="Save current substitutions to disk")
+            
+        match2 = matcher.match("Load Substitutions Config")
+        if match2 > 0:
+            yield Hit(match2, matcher.highlight("Load Substitutions Config"), lambda app=self.screen.app: app.action_load_subs(), help="Load saved substitutions from disk")
+
+class SaveConfigScreen(ModalScreen[str]):
+    CSS = """
+    SaveConfigScreen { align: center middle; background: $background 80%; }
+    #save-dialog { width: 60%; height: auto; padding: 1 2; background: $surface; border: thick $accent; }
+    """
+    def compose(self) -> ComposeResult:
+        with Vertical(id="save-dialog"):
+            yield Static("Enter configuration name:")
+            yield Input(placeholder="my_rules")
+            yield Static("Press Enter to save, ESC to cancel.")
+
+    def on_mount(self) -> None:
+        self.query_one(Input).focus()
+
+    @on(Input.Submitted)
+    def on_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value)
+
+class LoadConfigScreen(ModalScreen[str]):
+    CSS = """
+    LoadConfigScreen { align: center middle; background: $background 80%; }
+    #load-dialog { width: 60%; height: auto; padding: 1 2; background: $surface; border: thick $accent; }
+    """
+    def compose(self) -> ComposeResult:
+        with Vertical(id="load-dialog"):
+            yield Static("Select configuration to load (ESC to cancel):")
+            yield OptionList()
+            
+    def on_mount(self) -> None:
+        options = self.query_one(OptionList)
+        if CONFIG_DIR.exists():
+            for f in sorted(CONFIG_DIR.iterdir()):
+                if f.is_file():
+                    options.add_option(f.name)
+
+    @on(OptionList.OptionSelected)
+    def on_option_selected(self, event: OptionList.OptionSelected) -> None:
+        self.dismiss(event.option.prompt)
+
 
 # ---------------------------------------------------------------------------
 # Filter modal screen
@@ -421,6 +472,8 @@ class DockerTreeApp(App):
     }
     """
 
+    COMMANDS = App.COMMANDS | {SubstitutionsCommandProvider}
+    
     BINDINGS = [
         Binding("j", "cursor_down", "Down",     show=False),
         Binding("k", "cursor_up",   "Up",       show=False),
@@ -447,7 +500,8 @@ class DockerTreeApp(App):
         self._filter_string: str = ""
         self._compact_mode: bool = True
         self._combine_versions: bool = False
-        self._custom_patterns, _ = load_user_substitutions(SUBS_FILE)
+        self._custom_patterns_raw: str = DEFAULT_SUBS_TEXT
+        self._custom_patterns: list[tuple[re.Pattern, str]] = []
 
     # ------------------------------------------------------------------
     # Compose
@@ -724,16 +778,47 @@ class DockerTreeApp(App):
 
     def action_edit_substitutions(self) -> None:
         editor = os.environ.get("EDITOR", "nano")
+        fd, temp_path = tempfile.mkstemp(suffix=".txt")
+        with os.fdopen(fd, 'w') as f:
+            f.write(self._custom_patterns_raw)
+            
         with self.app.suspend():
-            subprocess.run([editor, str(SUBS_FILE)])
+            subprocess.run([editor, temp_path])
+            
+        with open(temp_path, 'r') as f:
+            new_text = f.read()
+            
+        os.remove(temp_path)
         
-        patterns, invalid = load_user_substitutions(SUBS_FILE)
+        new_text, patterns, invalid = parse_user_substitutions(new_text)
+        self._custom_patterns_raw = new_text
         self._custom_patterns = patterns
         
         if invalid:
             self.notify("Some substitutions were invalid and commented out.", severity="warning")
             
         self._apply_filter_and_rebuild()
+
+    def action_save_subs(self) -> None:
+        def check_save(filename: str | None) -> None:
+            if filename:
+                CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+                (CONFIG_DIR / filename).write_text(self._custom_patterns_raw)
+                self.notify(f"Saved to {filename}", title="Config Saved")
+        self.push_screen(SaveConfigScreen(), check_save)
+        
+    def action_load_subs(self) -> None:
+        def check_load(filename: str | None) -> None:
+            if filename and (CONFIG_DIR / filename).exists():
+                text = (CONFIG_DIR / filename).read_text()
+                new_text, patterns, invalid = parse_user_substitutions(text)
+                self._custom_patterns_raw = new_text
+                self._custom_patterns = patterns
+                if invalid:
+                    self.notify("Some loaded substitutions were invalid and commented out.", severity="warning")
+                self._apply_filter_and_rebuild()
+                self.notify(f"Loaded {filename}", title="Config Loaded")
+        self.push_screen(LoadConfigScreen(), check_load)
 
     def action_copy_cell(self) -> None:
         focused = self.app.focused
