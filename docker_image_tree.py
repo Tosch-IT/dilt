@@ -11,6 +11,9 @@ from __future__ import annotations
 import json
 import subprocess
 import pyperclip
+import shlex
+import os
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional, Callable
 
@@ -31,6 +34,45 @@ def normalize_command(command: str) -> str:
     for p, repl in NORMALIZE_PATTERNS:
         res = p.sub(repl, res)
     return res
+
+SUBS_FILE = Path(__file__).parent / "user_substitutions.txt"
+
+def load_user_substitutions(filepath: Path) -> tuple[list[tuple[re.Pattern, str]], bool]:
+    if not filepath.exists():
+        filepath.parent.mkdir(parents=True, exist_ok=True)
+        filepath.write_text('# Define custom regex replacements here.\n# Format: "<regex>" "<replacement>"\n# Example:\n# "^#(nop).*$" "<NOP>"\n\n')
+        return [], False
+    
+    with filepath.open('r') as f:
+        lines = f.readlines()
+        
+    patterns = []
+    invalid = False
+    new_lines = []
+    
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith('#'):
+            new_lines.append(line)
+            continue
+            
+        try:
+            tokens = shlex.split(line)
+            if len(tokens) != 2:
+                raise ValueError("Line must contain exactly two quoted strings.")
+            pat = re.compile(tokens[0])
+            repl = tokens[1]
+            patterns.append((pat, repl))
+            new_lines.append(line)
+        except Exception as e:
+            invalid = True
+            new_lines.append(f"# INVALID ({e}): {line.lstrip()}")
+    
+    if invalid:
+        with filepath.open('w') as f:
+            f.writelines(new_lines)
+            
+    return patterns, invalid
 
 from textual import on, work
 from textual.app import App, ComposeResult
@@ -166,7 +208,7 @@ def _layers_reversed(image: ImageMeta) -> list[LayerInfo]:
     return list(reversed(image.layers))
 
 
-def build_tree(images: list[ImageMeta], combine_versions: bool = False) -> list[TreeLayerNode]:
+def build_tree(images: list[ImageMeta], combine_versions: bool = False, custom_patterns: list[tuple[re.Pattern, str]] = None) -> list[TreeLayerNode]:
     """
     Build a shared-history tree.  Layers with the same command at the same
     depth under the same parent are merged into one node.
@@ -188,6 +230,9 @@ def build_tree(images: list[ImageMeta], combine_versions: bool = False) -> list[
             cmd = layer.created_by
             if combine_versions:
                 cmd = normalize_command(cmd)
+            if custom_patterns:
+                for p, repl in custom_patterns:
+                    cmd = p.sub(repl, cmd)
             node = find_or_create(current_level, cmd)
             node.image_layers.append((image, layer))
             current_level = node.children
@@ -386,6 +431,7 @@ class DockerTreeApp(App):
         Binding("y", "copy_cell",   "Copy Cell"),
         Binding("c", "toggle_compact", "Toggle Compact IDs", show=False),
         Binding("v", "toggle_combine", "Combine Versions"),
+        Binding("e", "edit_substitutions", "Edit Substitutions"),
         Binding("a", "toggle_all",  "Toggle All (Dangling)"),
         Binding("f", "filter",      "Filter Branches"),
         Binding("q", "quit",        "Quit"),
@@ -401,6 +447,7 @@ class DockerTreeApp(App):
         self._filter_string: str = ""
         self._compact_mode: bool = True
         self._combine_versions: bool = False
+        self._custom_patterns, _ = load_user_substitutions(SUBS_FILE)
 
     # ------------------------------------------------------------------
     # Compose
@@ -475,7 +522,7 @@ class DockerTreeApp(App):
             "Building layer tree…",
             f"{len(images)} image(s) — merging common ancestors",
         )
-        tree_roots = build_tree(images, combine_versions=self._combine_versions)
+        tree_roots = build_tree(images, combine_versions=self._combine_versions, custom_patterns=self._custom_patterns)
 
         # Hand off to main thread; use call_later so the phase label renders
         self.app.call_from_thread(self._on_data_ready, images, tree_roots)
@@ -515,7 +562,7 @@ class DockerTreeApp(App):
         else:
             filtered = self._images
 
-        self._tree_roots = build_tree(filtered, combine_versions=self._combine_versions)
+        self._tree_roots = build_tree(filtered, combine_versions=self._combine_versions, custom_patterns=self._custom_patterns)
         with self.batch_update():
             self._node_map.clear()
             self._populate_tree()
@@ -673,6 +720,19 @@ class DockerTreeApp(App):
 
     def action_toggle_combine(self) -> None:
         self._combine_versions = not self._combine_versions
+        self._apply_filter_and_rebuild()
+
+    def action_edit_substitutions(self) -> None:
+        editor = os.environ.get("EDITOR", "nano")
+        with self.app.suspend():
+            subprocess.run([editor, str(SUBS_FILE)])
+        
+        patterns, invalid = load_user_substitutions(SUBS_FILE)
+        self._custom_patterns = patterns
+        
+        if invalid:
+            self.notify("Some substitutions were invalid and commented out.", severity="warning")
+            
         self._apply_filter_and_rebuild()
 
     def action_copy_cell(self) -> None:
