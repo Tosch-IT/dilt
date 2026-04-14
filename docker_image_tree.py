@@ -87,7 +87,7 @@ def collect_images(
         on_progress(0, 0, "Listing all images…")  # phase: before loop
 
     cmd = [
-        "docker", "images", "--no-trunc",
+        "docker", "images", "--no-trunc", "--digests",
         "--format", "{{json .}}"
     ]
     if show_all:
@@ -364,6 +364,7 @@ class DockerTreeApp(App):
         Binding("u", "prev_tab",    "Prev tab", show=False),
         Binding("i", "next_tab",    "Next tab", show=False),
         Binding("y", "copy_cell",   "Copy Cell"),
+        Binding("c", "toggle_compact", "Toggle Compact IDs", show=False),
         Binding("a", "toggle_all",  "Toggle All (Dangling)"),
         Binding("f", "filter",      "Filter Branches"),
         Binding("q", "quit",        "Quit"),
@@ -377,6 +378,7 @@ class DockerTreeApp(App):
         self._selected_layer_node: Optional[TreeLayerNode] = None
         self._show_all: bool = False
         self._filter_string: str = ""
+        self._compact_mode: bool = True
 
     # ------------------------------------------------------------------
     # Compose
@@ -387,11 +389,11 @@ class DockerTreeApp(App):
         with Vertical(id="tree-panel"):
             yield Tree("Docker Image Layers", id="layer-tree")
         with Vertical(id="detail-panel"):
-            with TabbedContent(id="tabs"):
-                with TabPane("Full Command", id="tab-cmd"):
-                    yield Static("Select a layer in the tree above.", id="cmd-label")
+            with TabbedContent(id="tabs", initial="tab-images"):
                 with TabPane("Images", id="tab-images"):
                     yield DataTable(id="images-table")
+                with TabPane("Full Command", id="tab-cmd"):
+                    yield Static("Select a layer in the tree above.", id="cmd-label")
         yield Footer()
 
     # ------------------------------------------------------------------
@@ -412,6 +414,7 @@ class DockerTreeApp(App):
             "Layer Digest",
             "Built At",
             "Final Image Tag",
+            "Final Image ID",
             "Final Image Digest",
         )
 
@@ -494,11 +497,11 @@ class DockerTreeApp(App):
         with self.batch_update():
             self._node_map.clear()
             self._populate_tree()
-            
+
         tree = self.query_one("#layer-tree", Tree)
         if tree.root.children:
             tree.cursor_line = 0
-            
+
         count = len(filtered)
         self.sub_title = f"{count} image(s) shown" + (f" (filtered: '{self._filter_string}')" if self._filter_string else "")
 
@@ -507,7 +510,7 @@ class DockerTreeApp(App):
         self._apply_filter_and_rebuild()
         if self.screen_stack and isinstance(self.screen_stack[-1], LoadingScreen):
             self.pop_screen()
-        
+
         # Only watch once
         if not hasattr(self, "_cursor_watcher"):
             tree = self.query_one("#layer-tree", Tree)
@@ -562,15 +565,20 @@ class DockerTreeApp(App):
         # Use Text() everywhere – Docker strings contain [ ] which Rich
         # would mis-parse as markup tags, silently throwing MarkupError.
         cmd_label: Static = self.query_one("#cmd-label", Static)
-        cmd_label.update(Text(layer_node.command or "<empty>"))
+        cmd_label.update(Text(layer_node.command.replace(";  ", "\n") or "<empty>"))
 
         table: DataTable = self.query_one("#images-table", DataTable)
         table.clear()
         for image, layer in layer_node.image_layers:
+            image_id_str = image.image_id
+            if self._compact_mode:
+                image_id_str = image_id_str[7:19] if image_id_str.startswith("sha256:") else image_id_str[:12]
+
             table.add_row(
                 Text(layer.layer_id),
                 Text(layer.created_at),
                 Text(image.repo_tag),
+                Text(image_id_str),
                 Text(image.digest),
             )
 
@@ -635,6 +643,11 @@ class DockerTreeApp(App):
         self._show_all = not self._show_all
         self.push_screen(LoadingScreen())
         self._fetch_docker_data()
+
+    def action_toggle_compact(self) -> None:
+        self._compact_mode = not self._compact_mode
+        if self._selected_layer_node:
+            self._update_details(self._selected_layer_node)
 
     def action_copy_cell(self) -> None:
         focused = self.app.focused
