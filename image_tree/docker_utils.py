@@ -9,7 +9,17 @@ from image_tree.models import ImageMeta, LayerInfo, TreeLayerNode
 from image_tree.text_utils import normalize_command
 
 def run_json_lines(cmd: list[str]) -> list[dict]:
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+    except FileNotFoundError:
+        raise RuntimeError(f"Command '{cmd[0]}' not found. Is it installed and in your PATH?")
+
+    if result.returncode != 0:
+        if len(cmd) > 1 and cmd[1] == 'images':
+            err = result.stderr.strip()
+            raise RuntimeError(f"Failed to list images. Is Docker running? ({err})")
+        return []
+
     rows = []
     for line in result.stdout.splitlines():
         line = line.strip()

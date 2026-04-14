@@ -176,6 +176,12 @@ class DockerTreeApp(App):
         if self.screen_stack and isinstance(self.screen_stack[-1], LoadingScreen):
             self.screen_stack[-1].update_phase(title, detail)
 
+    def _on_fetch_error(self, error_msg: str) -> None:
+        self.notify(f"Error: {error_msg}", title="Data Fetch Failed", severity="error", timeout=10.0)
+        self._images = []
+        self._tree_roots = []
+        self.call_later(self._populate_and_dismiss)
+
     @work(thread=True, exclusive=True)
     def _fetch_docker_data(self) -> None:
         def on_progress(current: int, total: int, repo_tag: str) -> None:
@@ -194,18 +200,21 @@ class DockerTreeApp(App):
                     loading.update_progress, current, total, repo_tag
                 )
 
-        images = collect_images(on_progress=on_progress, show_all=self._show_all)
+        try:
+            images = collect_images(on_progress=on_progress, show_all=self._show_all)
 
-        # Phase: building the logical tree (CPU-only, fast but silent so far)
-        self.app.call_from_thread(
-            self._loading_phase,
-            "Building layer tree…",
-            f"{len(images)} image(s) — merging common ancestors",
-        )
-        tree_roots = build_tree(images, combine_versions=self._combine_versions, custom_patterns=self._custom_patterns)
+            # Phase: building the logical tree (CPU-only, fast but silent so far)
+            self.app.call_from_thread(
+                self._loading_phase,
+                "Building layer tree…",
+                f"{len(images)} image(s) — merging common ancestors",
+            )
+            tree_roots = build_tree(images, combine_versions=self._combine_versions, custom_patterns=self._custom_patterns)
 
-        # Hand off to main thread; use call_later so the phase label renders
-        self.app.call_from_thread(self._on_data_ready, images, tree_roots)
+            # Hand off to main thread; use call_later so the phase label renders
+            self.app.call_from_thread(self._on_data_ready, images, tree_roots)
+        except Exception as e:
+            self.app.call_from_thread(self._on_fetch_error, str(e))
 
     def _on_data_ready(
         self,
