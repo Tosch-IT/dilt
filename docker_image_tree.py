@@ -83,9 +83,10 @@ from textual.widgets import (
     DataTable,
     Tabs,
     Tree,
+    Button,
 )
 from textual.widgets.tree import TreeNode
-from textual.containers import Center, Middle, Vertical
+from textual.containers import Center, Middle, Vertical, Horizontal
 
 
 # ---------------------------------------------------------------------------
@@ -321,18 +322,47 @@ class LoadingScreen(ModalScreen):
 
 class SubstitutionsCommandProvider(Provider):
     async def discover(self):
-        yield DiscoveryHit("Save Substitutions Config", lambda app=self.screen.app: app.action_save_subs(), help="Save current substitutions to disk")
+        if hasattr(self.screen.app, "_current_config_name") and self.screen.app._current_config_name:
+            yield DiscoveryHit("Save Substitutions Config", lambda app=self.screen.app: app.action_save_subs(), help=f"Save substitutions to {self.screen.app._current_config_name}")
+        yield DiscoveryHit("Save Substitutions Config As...", lambda app=self.screen.app: app.action_save_subs_as(), help="Save current substitutions to disk with a new name")
         yield DiscoveryHit("Load Substitutions Config", lambda app=self.screen.app: app.action_load_subs(), help="Load saved substitutions from disk")
 
     async def search(self, query: str):
         matcher = self.matcher(query)
-        match1 = matcher.match("Save Substitutions Config")
+        if hasattr(self.screen.app, "_current_config_name") and self.screen.app._current_config_name:
+            match0 = matcher.match("Save Substitutions Config")
+            if match0 > 0:
+                yield Hit(match0, matcher.highlight("Save Substitutions Config"), lambda app=self.screen.app: app.action_save_subs(), help=f"Save substitutions to {self.screen.app._current_config_name}")
+                
+        match1 = matcher.match("Save Substitutions Config As...")
         if match1 > 0:
-            yield Hit(match1, matcher.highlight("Save Substitutions Config"), lambda app=self.screen.app: app.action_save_subs(), help="Save current substitutions to disk")
+            yield Hit(match1, matcher.highlight("Save Substitutions Config As..."), lambda app=self.screen.app: app.action_save_subs_as(), help="Save current substitutions to disk with a new name")
             
         match2 = matcher.match("Load Substitutions Config")
         if match2 > 0:
             yield Hit(match2, matcher.highlight("Load Substitutions Config"), lambda app=self.screen.app: app.action_load_subs(), help="Load saved substitutions from disk")
+
+class ConfirmOverwriteScreen(ModalScreen[bool]):
+    CSS = """
+    ConfirmOverwriteScreen { align: center middle; background: $background 80%; }
+    #confirm-dialog { width: 40; height: auto; padding: 1 2; background: $surface; border: thick $accent; }
+    #confirm-buttons { height: auto; align: center middle; margin-top: 1; }
+    #confirm-buttons Button { margin: 0 1; }
+    """
+    def __init__(self, filename: str):
+        super().__init__()
+        self.filename = filename
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="confirm-dialog"):
+            yield Static(f"File '{self.filename}' already exists.\nOverwrite?")
+            with Horizontal(id="confirm-buttons"):
+                yield Button("Yes", id="btn-yes", variant="warning")
+                yield Button("No", id="btn-no", variant="primary")
+
+    @on(Button.Pressed)
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id == "btn-yes")
 
 class SaveConfigScreen(ModalScreen[str]):
     CSS = """
@@ -502,6 +532,7 @@ class DockerTreeApp(App):
         self._combine_versions: bool = False
         self._custom_patterns_raw: str = DEFAULT_SUBS_TEXT
         self._custom_patterns: list[tuple[re.Pattern, str]] = []
+        self._current_config_name: Optional[str] = None
 
     # ------------------------------------------------------------------
     # Compose
@@ -800,11 +831,26 @@ class DockerTreeApp(App):
         self._apply_filter_and_rebuild()
 
     def action_save_subs(self) -> None:
+        if self._current_config_name:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            (CONFIG_DIR / self._current_config_name).write_text(self._custom_patterns_raw)
+            self.notify(f"Saved to {self._current_config_name}", title="Config Saved")
+            
+    def action_save_subs_as(self) -> None:
         def check_save(filename: str | None) -> None:
             if filename:
-                CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-                (CONFIG_DIR / filename).write_text(self._custom_patterns_raw)
-                self.notify(f"Saved to {filename}", title="Config Saved")
+                def do_save(overwrite: bool) -> None:
+                    if overwrite:
+                        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+                        (CONFIG_DIR / filename).write_text(self._custom_patterns_raw)
+                        self._current_config_name = filename
+                        self.notify(f"Saved to {filename}", title="Config Saved")
+                
+                if (CONFIG_DIR / filename).exists():
+                    self.push_screen(ConfirmOverwriteScreen(filename), do_save)
+                else:
+                    do_save(True)
+                    
         self.push_screen(SaveConfigScreen(), check_save)
         
     def action_load_subs(self) -> None:
@@ -814,6 +860,7 @@ class DockerTreeApp(App):
                 new_text, patterns, invalid = parse_user_substitutions(text)
                 self._custom_patterns_raw = new_text
                 self._custom_patterns = patterns
+                self._current_config_name = filename
                 if invalid:
                     self.notify("Some loaded substitutions were invalid and commented out.", severity="warning")
                 self._apply_filter_and_rebuild()
