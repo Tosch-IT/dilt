@@ -104,6 +104,8 @@ class DockerTreeApp(App):
         Binding("H", "collapse_branch", "Collapse Branch", show=False),
         Binding("u", "prev_tab",    "Prev tab", show=False),
         Binding("i", "next_tab",    "Next tab", show=False),
+        Binding("1", "focus_tree",  "Tree", show=False),
+        Binding("2", "focus_table", "Table", show=False),
         Binding("y", "copy_cell",   "Copy Cell"),
         Binding("c", "toggle_compact", "Toggle Compact IDs", show=False),
         Binding("v", "toggle_combine", "Combine Versions"),
@@ -420,6 +422,21 @@ class DockerTreeApp(App):
 
     def action_next_tab(self) -> None:
         self.query_one("#tabs Tabs", Tabs).action_next_tab()
+
+    def action_focus_tree(self) -> None:
+        self.query_one("#layer-tree", Tree).focus()
+
+    def action_focus_table(self) -> None:
+        table = self.query_one("#images-table", DataTable)
+        target_tab = self.query_one("#tab-images", TabPane)
+        tabs = self.query_one("#tabs", TabbedContent)
+        tabs.active = "tab-images"
+        table.focus()
+        if table.row_count > 0:
+            try:
+                table.move_cursor(row=0)
+            except Exception:
+                pass # fallback if move_cursor requires other args
 
     def action_filter(self) -> None:
         def check_filter(substring: str | None) -> None:
