@@ -44,13 +44,13 @@ def parse_user_substitutions(raw_text: str) -> tuple[str, list[tuple[re.Pattern,
     patterns = []
     invalid = False
     new_lines = []
-    
+
     for line in lines:
         stripped = line.strip()
         if not stripped or stripped.startswith('#'):
             new_lines.append(line)
             continue
-            
+
         try:
             tokens = shlex.split(stripped)
             if len(tokens) != 2:
@@ -62,7 +62,7 @@ def parse_user_substitutions(raw_text: str) -> tuple[str, list[tuple[re.Pattern,
         except Exception as e:
             invalid = True
             new_lines.append(f"# INVALID ({e}): {line.lstrip()}")
-            
+
     return "".join(new_lines), patterns, invalid
 
 from textual import on, work
@@ -333,11 +333,11 @@ class SubstitutionsCommandProvider(Provider):
             match0 = matcher.match("Save Substitutions Config")
             if match0 > 0:
                 yield Hit(match0, matcher.highlight("Save Substitutions Config"), lambda app=self.screen.app: app.action_save_subs(), help=f"Save substitutions to {self.screen.app._current_config_name}")
-                
+
         match1 = matcher.match("Save Substitutions Config As...")
         if match1 > 0:
             yield Hit(match1, matcher.highlight("Save Substitutions Config As..."), lambda app=self.screen.app: app.action_save_subs_as(), help="Save current substitutions to disk with a new name")
-            
+
         match2 = matcher.match("Load Substitutions Config")
         if match2 > 0:
             yield Hit(match2, matcher.highlight("Load Substitutions Config"), lambda app=self.screen.app: app.action_load_subs(), help="Load saved substitutions from disk")
@@ -391,7 +391,7 @@ class LoadConfigScreen(ModalScreen[str]):
         with Vertical(id="load-dialog"):
             yield Static("Select configuration to load (ESC to cancel):")
             yield OptionList()
-            
+
     def on_mount(self) -> None:
         options = self.query_one(OptionList)
         if CONFIG_DIR.exists():
@@ -503,12 +503,14 @@ class DockerTreeApp(App):
     """
 
     COMMANDS = App.COMMANDS | {SubstitutionsCommandProvider}
-    
+
     BINDINGS = [
         Binding("j", "cursor_down", "Down",     show=False),
         Binding("k", "cursor_up",   "Up",       show=False),
         Binding("l", "expand_node", "Expand",   show=False),
         Binding("h", "collapse_node","Collapse", show=False),
+        Binding("L", "expand_to_branch", "Expand to Branch", show=False),
+        Binding("H", "collapse_branch", "Collapse Branch", show=False),
         Binding("u", "prev_tab",    "Prev tab", show=False),
         Binding("i", "next_tab",    "Next tab", show=False),
         Binding("y", "copy_cell",   "Copy Cell"),
@@ -780,6 +782,32 @@ class DockerTreeApp(App):
             tree.cursor_node.collapse()
         self.call_later(self._update_from_cursor)
 
+    def action_expand_to_branch(self) -> None:
+        tree: Tree = self.query_one("#layer-tree", Tree)
+        node = tree.cursor_node
+        if node:
+            while True:
+                node.expand()
+                if len(node.children) == 1:
+                    node = node.children[0]
+                else:
+                    break
+        tree.move_cursor(node)
+        # There seems to be a bug in textual. If only called oncce, we sometimes end up at the root, instead
+        tree.move_cursor(node)
+        self.call_later(self._update_from_cursor)
+
+    def action_collapse_branch(self) -> None:
+        tree: Tree = self.query_one("#layer-tree", Tree)
+        node = tree.cursor_node
+        prev = node
+        while node and node != tree.root:
+            node.collapse()
+            prev = node
+            node = node.parent
+        tree.move_cursor(prev)
+        self.call_later(self._update_from_cursor)
+
     def action_prev_tab(self) -> None:
         self.query_one("#tabs Tabs", Tabs).action_previous_tab()
 
@@ -812,22 +840,22 @@ class DockerTreeApp(App):
         fd, temp_path = tempfile.mkstemp(suffix=".txt")
         with os.fdopen(fd, 'w') as f:
             f.write(self._custom_patterns_raw)
-            
+
         with self.app.suspend():
             subprocess.run([editor, temp_path])
-            
+
         with open(temp_path, 'r') as f:
             new_text = f.read()
-            
+
         os.remove(temp_path)
-        
+
         new_text, patterns, invalid = parse_user_substitutions(new_text)
         self._custom_patterns_raw = new_text
         self._custom_patterns = patterns
-        
+
         if invalid:
             self.notify("Some substitutions were invalid and commented out.", severity="warning")
-            
+
         self._apply_filter_and_rebuild()
 
     def action_save_subs(self) -> None:
@@ -835,7 +863,7 @@ class DockerTreeApp(App):
             CONFIG_DIR.mkdir(parents=True, exist_ok=True)
             (CONFIG_DIR / self._current_config_name).write_text(self._custom_patterns_raw)
             self.notify(f"Saved to {self._current_config_name}", title="Config Saved")
-            
+
     def action_save_subs_as(self) -> None:
         def check_save(filename: str | None) -> None:
             if filename:
@@ -845,14 +873,14 @@ class DockerTreeApp(App):
                         (CONFIG_DIR / filename).write_text(self._custom_patterns_raw)
                         self._current_config_name = filename
                         self.notify(f"Saved to {filename}", title="Config Saved")
-                
+
                 if (CONFIG_DIR / filename).exists():
                     self.push_screen(ConfirmOverwriteScreen(filename), do_save)
                 else:
                     do_save(True)
-                    
+
         self.push_screen(SaveConfigScreen(), check_save)
-        
+
     def action_load_subs(self) -> None:
         def check_load(filename: str | None) -> None:
             if filename and (CONFIG_DIR / filename).exists():
