@@ -22,6 +22,7 @@ from textual.screen import ModalScreen
 from textual.widgets import (
     Footer,
     Header,
+    Input,
     Label,
     LoadingIndicator,
     Static,
@@ -258,6 +259,48 @@ class LoadingScreen(ModalScreen):
 
 
 # ---------------------------------------------------------------------------
+# Filter modal screen
+# ---------------------------------------------------------------------------
+
+class FilterScreen(ModalScreen[str]):
+    """Modal screen to ask for filter string."""
+
+    BINDINGS = [Binding("escape", "quit", "Cancel")]
+
+    CSS = """
+    FilterScreen {
+        align: center middle;
+        background: $background 80%;
+    }
+
+    #filter-box {
+        width: 60;
+        height: auto;
+        border: double $accent;
+        background: $surface;
+        padding: 1 2;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        with Middle():
+            with Center():
+                with Vertical(id="filter-box"):
+                    yield Label("Filter branches by substring:")
+                    yield Input(placeholder="e.g. apt-get", id="filter-input")
+
+    def on_mount(self) -> None:
+        self.query_one(Input).focus()
+
+    @on(Input.Submitted)
+    def submit_filter(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value)
+
+    def action_quit(self) -> None:
+        self.dismiss("")
+
+
+# ---------------------------------------------------------------------------
 # Main App
 # ---------------------------------------------------------------------------
 
@@ -321,6 +364,7 @@ class DockerTreeApp(App):
         Binding("u", "prev_tab",    "Prev tab", show=False),
         Binding("i", "next_tab",    "Next tab", show=False),
         Binding("a", "toggle_all",  "Toggle All (Dangling)"),
+        Binding("f", "filter",      "Filter Branches"),
         Binding("q", "quit",        "Quit"),
     ]
 
@@ -331,6 +375,7 @@ class DockerTreeApp(App):
         self._node_map: dict[int, TreeLayerNode] = {}
         self._selected_layer_node: Optional[TreeLayerNode] = None
         self._show_all: bool = False
+        self._filter_string: str = ""
 
     # ------------------------------------------------------------------
     # Compose
@@ -428,18 +473,44 @@ class DockerTreeApp(App):
     # Tree population
     # ------------------------------------------------------------------
 
+    def _apply_filter_and_rebuild(self) -> None:
+        if self._filter_string:
+            fstr = self._filter_string.lower()
+            filtered = []
+            for img in self._images:
+                match = fstr in img.repo_tag.lower() or fstr in img.image_id.lower() or fstr in img.digest.lower()
+                if not match:
+                    for l in img.layers:
+                        if fstr in l.created_by.lower() or fstr in l.layer_id.lower():
+                            match = True
+                            break
+                if match:
+                    filtered.append(img)
+        else:
+            filtered = self._images
+
+        self._tree_roots = build_tree(filtered)
+        with self.batch_update():
+            self._node_map.clear()
+            self._populate_tree()
+            
+        tree = self.query_one("#layer-tree", Tree)
+        if tree.root.children:
+            tree.cursor_line = 0
+            
+        count = len(filtered)
+        self.sub_title = f"{count} image(s) shown" + (f" (filtered: '{self._filter_string}')" if self._filter_string else "")
+
     def _populate_and_dismiss(self) -> None:
         """Called one event-loop tick after the phase label renders."""
-        with self.batch_update():
-            self._populate_tree()
+        self._apply_filter_and_rebuild()
         if self.screen_stack and isinstance(self.screen_stack[-1], LoadingScreen):
             self.pop_screen()
-        self.sub_title = f"{len(self._images)} image(s) loaded"
-        # Now that _node_map is populated, watch the tree cursor directly.
-        # This is more reliable than @on(Tree.NodeHighlighted) which can
-        # miss events when focus or layering intervenes.
-        tree = self.query_one("#layer-tree", Tree)
-        self.watch(tree, "cursor_line", self._on_cursor_line_change, init=True)
+        
+        # Only watch once
+        if not hasattr(self, "_cursor_watcher"):
+            tree = self.query_one("#layer-tree", Tree)
+            self._cursor_watcher = self.watch(tree, "cursor_line", self._on_cursor_line_change, init=True)
 
     def _populate_tree(self) -> None:
         tree: Tree = self.query_one("#layer-tree", Tree)
@@ -551,6 +622,13 @@ class DockerTreeApp(App):
 
     def action_next_tab(self) -> None:
         self.query_one("#tabs Tabs", Tabs).action_next_tab()
+
+    def action_filter(self) -> None:
+        def check_filter(substring: str | None) -> None:
+            if substring is not None:
+                self._filter_string = substring
+                self._apply_filter_and_rebuild()
+        self.push_screen(FilterScreen(), check_filter)
 
     def action_toggle_all(self) -> None:
         self._show_all = not self._show_all
