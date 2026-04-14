@@ -1,4 +1,4 @@
-#!/home/tosch/scripts/dockerImagesTree/venv/bin/python3
+#!/usr/bin/env python3
 """
 Docker Images Tree TUI
 Visualizes the build history of Docker images as a shared tree,
@@ -7,448 +7,39 @@ background thread so the UI stays responsive.
 """
 
 from __future__ import annotations
-
-import json
 import subprocess
+
 import pyperclip
-import shlex
 import os
 import tempfile
-from pathlib import Path
-from dataclasses import dataclass, field
-from typing import Optional, Callable
+import re
+from typing import Optional
 
 from rich.text import Text
-
-import re
-
-NORMALIZE_PATTERNS = [
-    (re.compile(r'\b\d{1,3}(?:\.\d{1,3}){3}:\d+\b'), '<IP:PORT>'),
-    (re.compile(r'\b\d{1,3}(?:\.\d{1,3}){3}\b'), '<IP>'),
-    (re.compile(r'\b[a-fA-F0-9]{32,128}\b'), '<HASH>'),
-    (re.compile(r'\b(?:\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?|\d{4}[-/]\d{2}[-/]\d{2})|(?:\d{10,16})\b'), '<TIMESTAMP>'),
-    (re.compile(r'\b(?:v\d+(?:\.\d+)*(?:-[a-zA-Z0-9]+)*|\d+\.\d+(?:\.\d+)*(?:-[a-zA-Z0-9]+)*)\b'), '<VERSION>'),
-]
-
-def normalize_command(command: str) -> str:
-    res = command
-    for p, repl in NORMALIZE_PATTERNS:
-        res = p.sub(repl, res)
-    return res
-
-CONFIG_DIR = Path.home() / ".config" / "docker_image_tree" / "substitutions"
-DEFAULT_SUBS_TEXT = '# Define custom regex replacements here.\n# Format: "<regex>" "<replacement>"\n# Example:\n# "^#(nop).*$" "<NOP>"\n\n'
-
-def parse_user_substitutions(raw_text: str) -> tuple[str, list[tuple[re.Pattern, str]], bool]:
-    lines = raw_text.splitlines(keepends=True)
-    patterns = []
-    invalid = False
-    new_lines = []
-
-    for line in lines:
-        stripped = line.strip()
-        if not stripped or stripped.startswith('#'):
-            new_lines.append(line)
-            continue
-
-        try:
-            tokens = shlex.split(stripped)
-            if len(tokens) != 2:
-                raise ValueError("Line must contain exactly two quoted strings.")
-            pat = re.compile(tokens[0])
-            repl = tokens[1]
-            patterns.append((pat, repl))
-            new_lines.append(line)
-        except Exception as e:
-            invalid = True
-            new_lines.append(f"# INVALID ({e}): {line.lstrip()}")
-
-    return "".join(new_lines), patterns, invalid
 
 from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.screen import ModalScreen
-from textual.command import Provider, Hit, DiscoveryHit
 from textual.widgets import (
     Footer,
     Header,
-    Input,
-    OptionList,
-    Label,
-    LoadingIndicator,
     Static,
     TabbedContent,
     TabPane,
     DataTable,
     Tabs,
     Tree,
-    Button,
 )
 from textual.widgets.tree import TreeNode
-from textual.containers import Center, Middle, Vertical, Horizontal
-
-
-# ---------------------------------------------------------------------------
-# Data model
-# ---------------------------------------------------------------------------
-
-@dataclass
-class LayerInfo:
-    """One layer as reported by `docker history`."""
-    created_by: str
-    created_at: str
-    layer_id: str          # sha256:... or <missing>
-    size: str
-
-
-@dataclass
-class ImageMeta:
-    """Top-level image metadata."""
-    image_id: str          # short id
-    repo_tag: str          # repo:tag  or  <untagged>
-    digest: str            # sha256 of the image, or <none>
-    layers: list[LayerInfo] = field(default_factory=list)
-
-
-# ---------------------------------------------------------------------------
-# Docker data collection  (runs in background thread)
-# ---------------------------------------------------------------------------
-
-def run_json_lines(cmd: list[str]) -> list[dict]:
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    rows = []
-    for line in result.stdout.splitlines():
-        line = line.strip()
-        if line:
-            try:
-                rows.append(json.loads(line))
-            except json.JSONDecodeError:
-                pass
-    return rows
-
-
-def collect_images(
-    on_progress: Optional["Callable[[int, int, str], None]"] = None,
-    show_all: bool = False
-) -> list[ImageMeta]:
-    """
-    Collect all images and their layer histories.
-    on_progress(current, total, repo_tag) called after each history fetch.
-    """
-    if on_progress:
-        on_progress(0, 0, "Listing all images…")  # phase: before loop
-
-    cmd = [
-        "docker", "images", "--no-trunc", "--digests",
-        "--format", "{{json .}}"
-    ]
-    if show_all:
-        cmd.insert(2, "--all")
-    raw_images = run_json_lines(cmd)
-    total = len(raw_images)
-
-    images: list[ImageMeta] = []
-    for idx, raw in enumerate(raw_images, start=1):
-        repo = raw.get("Repository", "")
-        tag  = raw.get("Tag", "")
-        repo_tag = f"{repo}:{tag}" if repo and repo != "<none>" else "<untagged>"
-        digest = raw.get("Digest", "<none>") or "<none>"
-        image_id = raw.get("ID", "")
-
-        history_rows = run_json_lines([
-            "docker", "history", "--no-trunc",
-            "--format", "{{json .}}",
-            image_id
-        ])
-
-        layers: list[LayerInfo] = []
-        for h in history_rows:
-            layers.append(LayerInfo(
-                created_by=h.get("CreatedBy", ""),
-                created_at=h.get("CreatedAt", ""),
-                layer_id=h.get("ID", "<missing>") or "<missing>",
-                size=h.get("Size", ""),
-            ))
-
-        images.append(ImageMeta(
-            image_id=image_id,
-            repo_tag=repo_tag,
-            digest=digest,
-            layers=layers,
-        ))
-
-        # Report *after* history fetch so counter reflects completed work
-        if on_progress:
-            on_progress(idx, total, repo_tag)
-
-    return images
-
-
-# ---------------------------------------------------------------------------
-# Tree builder
-# ---------------------------------------------------------------------------
-
-@dataclass
-class TreeLayerNode:
-    """Node in our logical layer tree."""
-    command: str
-    children: list["TreeLayerNode"] = field(default_factory=list)
-    image_layers: list[tuple[ImageMeta, LayerInfo]] = field(default_factory=list)
-
-
-def _layers_reversed(image: ImageMeta) -> list[LayerInfo]:
-    """docker history lists newest first; reverse to get oldest-first (root→tip)."""
-    return list(reversed(image.layers))
-
-
-def build_tree(images: list[ImageMeta], combine_versions: bool = False, custom_patterns: list[tuple[re.Pattern, str]] = None) -> list[TreeLayerNode]:
-    """
-    Build a shared-history tree.  Layers with the same command at the same
-    depth under the same parent are merged into one node.
-    """
-    roots: list[TreeLayerNode] = []
-
-    def find_or_create(nodes: list[TreeLayerNode], command: str) -> TreeLayerNode:
-        for n in nodes:
-            if n.command == command:
-                return n
-        new_node = TreeLayerNode(command=command)
-        nodes.append(new_node)
-        return new_node
-
-    for image in images:
-        layers = _layers_reversed(image)
-        current_level = roots
-        for layer in layers:
-            cmd = layer.created_by
-            if combine_versions:
-                cmd = normalize_command(cmd)
-            if custom_patterns:
-                for p, repl in custom_patterns:
-                    cmd = p.sub(repl, cmd)
-            node = find_or_create(current_level, cmd)
-            node.image_layers.append((image, layer))
-            current_level = node.children
-
-    return roots
-
-
-# ---------------------------------------------------------------------------
-# Loading modal screen
-# ---------------------------------------------------------------------------
-
-class LoadingScreen(ModalScreen):
-    """Fullscreen modal shown while docker data is being fetched."""
-
-    # q must always be reachable, even while this modal is on top
-    BINDINGS = [Binding("q", "quit", "Quit")]
-
-    CSS = """
-    LoadingScreen {
-        align: center middle;
-        background: $background 80%;
-    }
-
-    #loading-box {
-        width: 60;
-        height: 9;
-        border: double $accent;
-        background: $surface;
-        padding: 1 2;
-    }
-
-    #loading-title {
-        text-align: center;
-        color: $accent;
-        text-style: bold;
-        margin-bottom: 0;
-    }
-
-    #loading-progress {
-        text-align: center;
-        color: $text-muted;
-        height: 1;
-        margin-bottom: 1;
-    }
-
-    #loading-current {
-        text-align: center;
-        color: $text;
-        height: 1;
-        overflow: hidden;
-    }
-
-    LoadingIndicator {
-        height: 3;
-    }
-    """
-
-    def compose(self) -> ComposeResult:
-        with Middle():
-            with Center():
-                with Vertical(id="loading-box"):
-                    yield Label("Fetching Docker history…", id="loading-title")
-                    yield Label("", id="loading-progress")
-                    yield Label("", id="loading-current")
-                    yield LoadingIndicator()
-
-    def action_quit(self) -> None:  # noqa: D401
-        self.app.exit()
-
-    def update_progress(self, current: int, total: int, repo_tag: str) -> None:
-        self.query_one("#loading-progress", Label).update(
-            f"[{current}/{total}]"
-        )
-        max_w = 54
-        display = repo_tag if len(repo_tag) <= max_w else "…" + repo_tag[-(max_w - 1):]
-        try:
-            self.query_one("#loading-current", Label).update(display)
-        except Exception:
-            pass
-
-    def update_phase(self, title: str, detail: str = "") -> None:
-        """Switch the title/detail line (e.g. to 'Building tree…')."""
-        try:
-            self.query_one("#loading-title", Label).update(title)
-            self.query_one("#loading-progress", Label).update(detail)
-            self.query_one("#loading-current", Label).update("")
-        except Exception:
-            pass  # screen not yet fully mounted – ignore
-
-# ---------------------------------------------------------------------------
-# Command Palette & Config Modals
-# ---------------------------------------------------------------------------
-
-class SubstitutionsCommandProvider(Provider):
-    async def discover(self):
-        if hasattr(self.screen.app, "_current_config_name") and self.screen.app._current_config_name:
-            yield DiscoveryHit("Save Substitutions Config", lambda app=self.screen.app: app.action_save_subs(), help=f"Save substitutions to {self.screen.app._current_config_name}")
-        yield DiscoveryHit("Save Substitutions Config As...", lambda app=self.screen.app: app.action_save_subs_as(), help="Save current substitutions to disk with a new name")
-        yield DiscoveryHit("Load Substitutions Config", lambda app=self.screen.app: app.action_load_subs(), help="Load saved substitutions from disk")
-
-    async def search(self, query: str):
-        matcher = self.matcher(query)
-        if hasattr(self.screen.app, "_current_config_name") and self.screen.app._current_config_name:
-            match0 = matcher.match("Save Substitutions Config")
-            if match0 > 0:
-                yield Hit(match0, matcher.highlight("Save Substitutions Config"), lambda app=self.screen.app: app.action_save_subs(), help=f"Save substitutions to {self.screen.app._current_config_name}")
-
-        match1 = matcher.match("Save Substitutions Config As...")
-        if match1 > 0:
-            yield Hit(match1, matcher.highlight("Save Substitutions Config As..."), lambda app=self.screen.app: app.action_save_subs_as(), help="Save current substitutions to disk with a new name")
-
-        match2 = matcher.match("Load Substitutions Config")
-        if match2 > 0:
-            yield Hit(match2, matcher.highlight("Load Substitutions Config"), lambda app=self.screen.app: app.action_load_subs(), help="Load saved substitutions from disk")
-
-class ConfirmOverwriteScreen(ModalScreen[bool]):
-    CSS = """
-    ConfirmOverwriteScreen { align: center middle; background: $background 80%; }
-    #confirm-dialog { width: 40; height: auto; padding: 1 2; background: $surface; border: thick $accent; }
-    #confirm-buttons { height: auto; align: center middle; margin-top: 1; }
-    #confirm-buttons Button { margin: 0 1; }
-    """
-    def __init__(self, filename: str):
-        super().__init__()
-        self.filename = filename
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="confirm-dialog"):
-            yield Static(f"File '{self.filename}' already exists.\nOverwrite?")
-            with Horizontal(id="confirm-buttons"):
-                yield Button("Yes", id="btn-yes", variant="warning")
-                yield Button("No", id="btn-no", variant="primary")
-
-    @on(Button.Pressed)
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        self.dismiss(event.button.id == "btn-yes")
-
-class SaveConfigScreen(ModalScreen[str]):
-    CSS = """
-    SaveConfigScreen { align: center middle; background: $background 80%; }
-    #save-dialog { width: 60%; height: auto; padding: 1 2; background: $surface; border: thick $accent; }
-    """
-    def compose(self) -> ComposeResult:
-        with Vertical(id="save-dialog"):
-            yield Static("Enter configuration name:")
-            yield Input(placeholder="my_rules")
-            yield Static("Press Enter to save, ESC to cancel.")
-
-    def on_mount(self) -> None:
-        self.query_one(Input).focus()
-
-    @on(Input.Submitted)
-    def on_submitted(self, event: Input.Submitted) -> None:
-        self.dismiss(event.value)
-
-class LoadConfigScreen(ModalScreen[str]):
-    CSS = """
-    LoadConfigScreen { align: center middle; background: $background 80%; }
-    #load-dialog { width: 60%; height: auto; padding: 1 2; background: $surface; border: thick $accent; }
-    """
-    def compose(self) -> ComposeResult:
-        with Vertical(id="load-dialog"):
-            yield Static("Select configuration to load (ESC to cancel):")
-            yield OptionList()
-
-    def on_mount(self) -> None:
-        options = self.query_one(OptionList)
-        if CONFIG_DIR.exists():
-            for f in sorted(CONFIG_DIR.iterdir()):
-                if f.is_file():
-                    options.add_option(f.name)
-
-    @on(OptionList.OptionSelected)
-    def on_option_selected(self, event: OptionList.OptionSelected) -> None:
-        self.dismiss(event.option.prompt)
-
-
-# ---------------------------------------------------------------------------
-# Filter modal screen
-# ---------------------------------------------------------------------------
-
-class FilterScreen(ModalScreen[str]):
-    """Modal screen to ask for filter string."""
-
-    BINDINGS = [Binding("escape", "quit", "Cancel")]
-
-    CSS = """
-    FilterScreen {
-        align: center middle;
-        background: $background 80%;
-    }
-
-    #filter-box {
-        width: 60;
-        height: auto;
-        border: double $accent;
-        background: $surface;
-        padding: 1 2;
-    }
-    """
-
-    def compose(self) -> ComposeResult:
-        with Middle():
-            with Center():
-                with Vertical(id="filter-box"):
-                    yield Label("Filter branches by substring:")
-                    yield Input(placeholder="e.g. apt-get", id="filter-input")
-
-    def on_mount(self) -> None:
-        self.query_one(Input).focus()
-
-    @on(Input.Submitted)
-    def submit_filter(self, event: Input.Submitted) -> None:
-        self.dismiss(event.value)
-
-    def action_quit(self) -> None:
-        self.dismiss("")
-
-
-# ---------------------------------------------------------------------------
-# Main App
-# ---------------------------------------------------------------------------
+from textual.containers import Vertical
+
+# Import from our modules
+from image_tree.models import ImageMeta, TreeLayerNode
+from image_tree.config import CONFIG_DIR, DEFAULT_SUBS_TEXT
+from image_tree.text_utils import parse_user_substitutions
+from image_tree.docker_utils import collect_images, build_tree
+from image_tree.screens import LoadingScreen, ConfirmOverwriteScreen, SaveConfigScreen, LoadConfigScreen, FilterScreen
+from image_tree.commands import SubstitutionsCommandProvider
 
 class DockerTreeApp(App):
     CSS = """
@@ -575,7 +166,7 @@ class DockerTreeApp(App):
         )
 
     # ------------------------------------------------------------------
-    # Background worker – runs collect_images + build_tree in a thread
+    # Background worker
     # ------------------------------------------------------------------
 
     def _loading_phase(self, title: str, detail: str = "") -> None:
@@ -922,11 +513,6 @@ class DockerTreeApp(App):
                 self.notify(f"Copied: {text_to_copy[:40]}", title="Clipboard")
             except Exception as e:
                 self.notify(f"Failed to copy: {e}", severity="error")
-
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     DockerTreeApp().run()
