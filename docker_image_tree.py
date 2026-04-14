@@ -354,24 +354,40 @@ class DockerTreeApp(App):
                 self._update_details(layer_node)
 
     def action_cursor_down(self) -> None:
-        self.query_one("#layer-tree", Tree).action_cursor_down()
-        self.call_later(self._update_from_cursor)
+        focused = self.app.focused
+        if focused is not None and focused.id == "images-table":
+            focused.action_cursor_down()
+        else:
+            self.query_one("#layer-tree", Tree).action_cursor_down()
+            self.call_later(self._update_from_cursor)
 
     def action_cursor_up(self) -> None:
-        self.query_one("#layer-tree", Tree).action_cursor_up()
-        self.call_later(self._update_from_cursor)
+        focused = self.app.focused
+        if focused is not None and focused.id == "images-table":
+            focused.action_cursor_up()
+        else:
+            self.query_one("#layer-tree", Tree).action_cursor_up()
+            self.call_later(self._update_from_cursor)
 
     def action_expand_node(self) -> None:
-        tree: Tree = self.query_one("#layer-tree", Tree)
-        if tree.cursor_node:
-            tree.cursor_node.expand()
-        self.call_later(self._update_from_cursor)
+        focused = self.app.focused
+        if focused is not None and focused.id == "images-table":
+            focused.action_cursor_right()
+        else:
+            tree: Tree = self.query_one("#layer-tree", Tree)
+            if tree.cursor_node:
+                tree.cursor_node.expand()
+            self.call_later(self._update_from_cursor)
 
     def action_collapse_node(self) -> None:
-        tree: Tree = self.query_one("#layer-tree", Tree)
-        if tree.cursor_node:
-            tree.cursor_node.collapse()
-        self.call_later(self._update_from_cursor)
+        focused = self.app.focused
+        if focused is not None and focused.id == "images-table":
+            focused.action_cursor_left()
+        else:
+            tree: Tree = self.query_one("#layer-tree", Tree)
+            if tree.cursor_node:
+                tree.cursor_node.collapse()
+            self.call_later(self._update_from_cursor)
 
     def action_expand_to_branch(self) -> None:
         tree: Tree = self.query_one("#layer-tree", Tree)
