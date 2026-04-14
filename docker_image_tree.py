@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import pyperclip
 from dataclasses import dataclass, field
 from typing import Optional, Callable
 
@@ -672,7 +673,7 @@ class DockerTreeApp(App):
 
         if text_to_copy:
             try:
-                self.app.copy_to_clipboard(text_to_copy)
+                pyperclip.copy(text_to_copy)
                 self.notify(f"Copied: {text_to_copy[:40]}", title="Clipboard")
             except Exception as e:
                 self.notify(f"Failed to copy: {e}", severity="error")
