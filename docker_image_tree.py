@@ -16,6 +16,22 @@ from typing import Optional, Callable
 
 from rich.text import Text
 
+import re
+
+NORMALIZE_PATTERNS = [
+    (re.compile(r'\b\d{1,3}(?:\.\d{1,3}){3}:\d+\b'), '<IP:PORT>'),
+    (re.compile(r'\b\d{1,3}(?:\.\d{1,3}){3}\b'), '<IP>'),
+    (re.compile(r'\b[a-fA-F0-9]{32,128}\b'), '<HASH>'),
+    (re.compile(r'\b(?:\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?|\d{4}[-/]\d{2}[-/]\d{2})|(?:\d{10,16})\b'), '<TIMESTAMP>'),
+    (re.compile(r'\b(?:v\d+(?:\.\d+)*(?:-[a-zA-Z0-9]+)*|\d+\.\d+(?:\.\d+)*(?:-[a-zA-Z0-9]+)*)\b'), '<VERSION>'),
+]
+
+def normalize_command(command: str) -> str:
+    res = command
+    for p, repl in NORMALIZE_PATTERNS:
+        res = p.sub(repl, res)
+    return res
+
 from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -150,7 +166,7 @@ def _layers_reversed(image: ImageMeta) -> list[LayerInfo]:
     return list(reversed(image.layers))
 
 
-def build_tree(images: list[ImageMeta]) -> list[TreeLayerNode]:
+def build_tree(images: list[ImageMeta], combine_versions: bool = False) -> list[TreeLayerNode]:
     """
     Build a shared-history tree.  Layers with the same command at the same
     depth under the same parent are merged into one node.
@@ -169,7 +185,10 @@ def build_tree(images: list[ImageMeta]) -> list[TreeLayerNode]:
         layers = _layers_reversed(image)
         current_level = roots
         for layer in layers:
-            node = find_or_create(current_level, layer.created_by)
+            cmd = layer.created_by
+            if combine_versions:
+                cmd = normalize_command(cmd)
+            node = find_or_create(current_level, cmd)
             node.image_layers.append((image, layer))
             current_level = node.children
 
@@ -366,6 +385,7 @@ class DockerTreeApp(App):
         Binding("i", "next_tab",    "Next tab", show=False),
         Binding("y", "copy_cell",   "Copy Cell"),
         Binding("c", "toggle_compact", "Toggle Compact IDs", show=False),
+        Binding("v", "toggle_combine", "Combine Versions"),
         Binding("a", "toggle_all",  "Toggle All (Dangling)"),
         Binding("f", "filter",      "Filter Branches"),
         Binding("q", "quit",        "Quit"),
@@ -380,6 +400,7 @@ class DockerTreeApp(App):
         self._show_all: bool = False
         self._filter_string: str = ""
         self._compact_mode: bool = True
+        self._combine_versions: bool = False
 
     # ------------------------------------------------------------------
     # Compose
@@ -454,7 +475,7 @@ class DockerTreeApp(App):
             "Building layer tree…",
             f"{len(images)} image(s) — merging common ancestors",
         )
-        tree_roots = build_tree(images)
+        tree_roots = build_tree(images, combine_versions=self._combine_versions)
 
         # Hand off to main thread; use call_later so the phase label renders
         self.app.call_from_thread(self._on_data_ready, images, tree_roots)
@@ -494,7 +515,7 @@ class DockerTreeApp(App):
         else:
             filtered = self._images
 
-        self._tree_roots = build_tree(filtered)
+        self._tree_roots = build_tree(filtered, combine_versions=self._combine_versions)
         with self.batch_update():
             self._node_map.clear()
             self._populate_tree()
@@ -649,6 +670,10 @@ class DockerTreeApp(App):
         self._compact_mode = not self._compact_mode
         if self._selected_layer_node:
             self._update_details(self._selected_layer_node)
+
+    def action_toggle_combine(self) -> None:
+        self._combine_versions = not self._combine_versions
+        self._apply_filter_and_rebuild()
 
     def action_copy_cell(self) -> None:
         focused = self.app.focused
