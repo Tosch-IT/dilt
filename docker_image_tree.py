@@ -75,7 +75,8 @@ def run_json_lines(cmd: list[str]) -> list[dict]:
 
 
 def collect_images(
-    on_progress: Optional["Callable[[int, int, str], None]"] = None
+    on_progress: Optional["Callable[[int, int, str], None]"] = None,
+    show_all: bool = False
 ) -> list[ImageMeta]:
     """
     Collect all images and their layer histories.
@@ -84,10 +85,13 @@ def collect_images(
     if on_progress:
         on_progress(0, 0, "Listing all images…")  # phase: before loop
 
-    raw_images = run_json_lines([
+    cmd = [
         "docker", "images", "--no-trunc",
         "--format", "{{json .}}"
-    ])
+    ]
+    if show_all:
+        cmd.insert(2, "--all")
+    raw_images = run_json_lines(cmd)
     total = len(raw_images)
 
     images: list[ImageMeta] = []
@@ -316,6 +320,7 @@ class DockerTreeApp(App):
         Binding("h", "collapse_node","Collapse", show=False),
         Binding("u", "prev_tab",    "Prev tab", show=False),
         Binding("i", "next_tab",    "Next tab", show=False),
+        Binding("a", "toggle_all",  "Toggle All (Dangling)"),
         Binding("q", "quit",        "Quit"),
     ]
 
@@ -325,6 +330,7 @@ class DockerTreeApp(App):
         self._tree_roots: list[TreeLayerNode] = []
         self._node_map: dict[int, TreeLayerNode] = {}
         self._selected_layer_node: Optional[TreeLayerNode] = None
+        self._show_all: bool = False
 
     # ------------------------------------------------------------------
     # Compose
@@ -390,7 +396,7 @@ class DockerTreeApp(App):
                     loading.update_progress, current, total, repo_tag
                 )
 
-        images = collect_images(on_progress=on_progress)
+        images = collect_images(on_progress=on_progress, show_all=self._show_all)
 
         # Phase: building the logical tree (CPU-only, fast but silent so far)
         self.app.call_from_thread(
@@ -545,6 +551,11 @@ class DockerTreeApp(App):
 
     def action_next_tab(self) -> None:
         self.query_one("#tabs Tabs", Tabs).action_next_tab()
+
+    def action_toggle_all(self) -> None:
+        self._show_all = not self._show_all
+        self.push_screen(LoadingScreen())
+        self._fetch_docker_data()
 
 
 # ---------------------------------------------------------------------------
