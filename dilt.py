@@ -110,6 +110,7 @@ class DockerTreeApp(App):
         Binding("c", "toggle_compact", "Toggle Compact IDs", show=False),
         Binding("v", "toggle_combine", "Combine Versions"),
         Binding("e", "edit_substitutions", "Edit Substitutions"),
+        Binding("d", "toggle_digest_mode", "Digest Mode"),
         Binding("a", "toggle_all",  "Toggle All (Dangling)"),
         Binding("f", "filter",      "Filter Branches"),
         Binding("q", "quit",        "Quit"),
@@ -125,6 +126,7 @@ class DockerTreeApp(App):
         self._filter_string: str = ""
         self._compact_mode: bool = True
         self._combine_versions: bool = False
+        self._digest_mode: bool = False
         self._custom_patterns_raw: str = DEFAULT_SUBS_TEXT
         self._custom_patterns: list[tuple[re.Pattern, str]] = []
         self._current_config_name: Optional[str] = None
@@ -209,7 +211,7 @@ class DockerTreeApp(App):
                 "Building layer tree…",
                 f"{len(images)} image(s) — merging common ancestors",
             )
-            tree_roots = build_tree(images, combine_versions=self._combine_versions, custom_patterns=self._custom_patterns)
+            tree_roots = build_tree(images, combine_versions=self._combine_versions, custom_patterns=self._custom_patterns, digest_mode=self._digest_mode)
 
             # Hand off to main thread; use call_later so the phase label renders
             self.app.call_from_thread(self._on_data_ready, images, tree_roots)
@@ -246,12 +248,17 @@ class DockerTreeApp(App):
                         if fstr in l.created_by.lower() or fstr in l.layer_id.lower():
                             match = True
                             break
+                if not match:
+                    for d in img.rootfs_layers:
+                        if fstr in d.lower():
+                            match = True
+                            break
                 if match:
                     filtered.append(img)
         else:
             filtered = self._images
 
-        self._tree_roots = build_tree(filtered, combine_versions=self._combine_versions, custom_patterns=self._custom_patterns)
+        self._tree_roots = build_tree(filtered, combine_versions=self._combine_versions, custom_patterns=self._custom_patterns, digest_mode=self._digest_mode)
         with self.batch_update():
             self._node_map.clear()
             self._populate_tree()
@@ -466,6 +473,10 @@ class DockerTreeApp(App):
 
     def action_toggle_combine(self) -> None:
         self._combine_versions = not self._combine_versions
+        self._apply_filter_and_rebuild()
+
+    def action_toggle_digest_mode(self) -> None:
+        self._digest_mode = not self._digest_mode
         self._apply_filter_and_rebuild()
 
     def action_edit_substitutions(self) -> None:
