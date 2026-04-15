@@ -33,3 +33,4 @@ For a non interactive cli version, instead of a tui, you might want to check out
 This project is not affiliated with Docker.
 
 As this is a relatively straightforward tool, it was written with significant assistance from AI to ensure a rapid development process.
+Still, this project is in its early stages.
