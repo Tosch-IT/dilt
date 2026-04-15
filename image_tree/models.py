@@ -18,6 +18,7 @@ class ImageMeta:
     repo_tag: str          # repo:tag  or  <untagged>
     digest: str            # sha256 of the image, or <none>
     layers: list[LayerInfo] = field(default_factory=list)
+    rootfs_layers: list[str] = field(default_factory=list)
 
 @dataclass
 class TreeLayerNode:

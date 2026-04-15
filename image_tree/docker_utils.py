@@ -50,6 +50,19 @@ def collect_images(
     raw_images = run_json_lines(cmd)
     total = len(raw_images)
 
+    image_ids = [raw.get("ID", "") for raw in raw_images if raw.get("ID")]
+    inspect_data = {}
+    if image_ids:
+        chunk_size = 50
+        for i in range(0, len(image_ids), chunk_size):
+            chunk = image_ids[i:i+chunk_size]
+            res = subprocess.run(["docker", "inspect"] + chunk, capture_output=True, text=True)
+            if res.returncode == 0:
+                raw_inspect = json.loads(res.stdout)
+                for i_data in raw_inspect:
+                    if isinstance(i_data, dict):
+                        inspect_data[i_data.get("Id", "")] = i_data.get("RootFS", {}).get("Layers", [])
+
     images: list[ImageMeta] = []
     for idx, raw in enumerate(raw_images, start=1):
         repo = raw.get("Repository", "")
@@ -78,6 +91,7 @@ def collect_images(
             repo_tag=repo_tag,
             digest=digest,
             layers=layers,
+            rootfs_layers=inspect_data.get(image_id, []),
         ))
 
         # Report *after* history fetch so counter reflects completed work
@@ -90,7 +104,7 @@ def _layers_reversed(image: ImageMeta) -> list[LayerInfo]:
     """docker history lists newest first; reverse to get oldest-first (root→tip)."""
     return list(reversed(image.layers))
 
-def build_tree(images: list[ImageMeta], combine_versions: bool = False, custom_patterns: list[tuple[re.Pattern, str]] = None) -> list[TreeLayerNode]:
+def build_tree(images: list[ImageMeta], combine_versions: bool = False, custom_patterns: list[tuple[re.Pattern, str]] = None, digest_mode: bool = False) -> list[TreeLayerNode]:
     """
     Build a shared-history tree.  Layers with the same command at the same
     depth under the same parent are merged into one node.
@@ -106,17 +120,26 @@ def build_tree(images: list[ImageMeta], combine_versions: bool = False, custom_p
         return new_node
 
     for image in images:
-        layers = _layers_reversed(image)
-        current_level = roots
-        for layer in layers:
-            cmd = layer.created_by
-            if combine_versions:
-                cmd = normalize_command(cmd)
-            if custom_patterns:
-                for p, repl in custom_patterns:
-                    cmd = p.sub(repl, cmd)
-            node = find_or_create(current_level, cmd)
-            node.image_layers.append((image, layer))
-            current_level = node.children
+        if digest_mode:
+            current_level = roots
+            for digest in image.rootfs_layers:
+                node = find_or_create(current_level, digest)
+                # Create fake layer info for the details panel
+                fake_layer = LayerInfo(created_by="(digest mode)", created_at="", layer_id=digest, size="")
+                node.image_layers.append((image, fake_layer))
+                current_level = node.children
+        else:
+            layers = _layers_reversed(image)
+            current_level = roots
+            for layer in layers:
+                cmd = layer.created_by
+                if combine_versions:
+                    cmd = normalize_command(cmd)
+                if custom_patterns:
+                    for p, repl in custom_patterns:
+                        cmd = p.sub(repl, cmd)
+                node = find_or_create(current_level, cmd)
+                node.image_layers.append((image, layer))
+                current_level = node.children
 
     return roots
